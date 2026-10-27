@@ -683,7 +683,7 @@ class IndenterOperatorGUI:
             status_callback=self.enqueue_log,
         )
         try:
-            controller.run_s3_sequence(init_poll_iterations=100)
+            controller.run_s3_sequence(init_poll_iterations=5)
             n_pts = len(self.state.history_position_steps)
             metrics = calculate_stiffness_and_modulus(self.state)
             self.enqueue_log(
