@@ -1,6 +1,9 @@
 """
 s3_indentation_controller.py
 Replaces LabVIEW 'S3Motor_control2017m.vi' (Screenshots 13, 14, and Case 0/1/2).
+Keeps COM4 quiet during Case 1 Frame 2 movement while smoothly interpolating
+live stepper position from speed_parameter so the X-Y Hysteresis Loop and
+Stiffness (g/mm) calculation are accurately synchronized.
 """
 
 import time
@@ -46,19 +49,38 @@ class S3IndentationController:
         )
         return pos_now
 
-    def _safe_wait_with_daq_polling(self, duration_s: float, start_time: float) -> None:
+    def _safe_wait_with_daq_polling(
+        self,
+        duration_s: float,
+        start_time: float,
+        start_pos_steps: int,
+        target_pos_steps: int,
+    ) -> None:
         """
-        Replaces LabVIEW's Wait (ms) inside Case 1 Frame 2 (停留時間(秒) * 1000),
-        polling DAQ every 100 ms while keeping COM4 quiet during movement.
+        Replaces LabVIEW's Wait (ms) inside Case 1 Frame 2 (停留時間(秒) * 1000).
+        Polls DAQ every 100 ms while keeping COM4 quiet during movement,
+        and interpolates stepper position using speed_parameter so the
+        X-Y Hysteresis Plot and Stiffness slope are accurately synchronized.
         """
-        end_time = time.time() + duration_s
+        t0 = time.time()
+        end_time = t0 + duration_s
+        delta_steps = target_pos_steps - start_pos_steps
+        direction = 1 if delta_steps >= 0 else -1
+        speed = max(1, self.state.speed_parameter)
+
         while time.time() < end_time:
             if self.state.stop_requested or self.state.emergency_stop_triggered:
                 break
+            now = time.time()
+            dt = now - t0
+            moved = min(abs(delta_steps), int(round(speed * dt)))
+            est_pos = start_pos_steps + (direction * moved)
+            self.state.stepper_position_steps = est_pos
+
             v_now, f_now = self.daq.read_live_force(check_safety=True)
             self.state.record_sample(
-                elapsed_s=time.time() - start_time,
-                pos_steps=self.state.stepper_position_steps,
+                elapsed_s=now - start_time,
+                pos_steps=est_pos,
                 voltage_v=v_now,
                 force_g=f_now,
             )
@@ -106,7 +128,6 @@ class S3IndentationController:
         case_selection: int = 0
         prev_pos: int = 0
         current_pos: int = self.state.stepper_position_steps
-        # Align set_position to current starting position if motor is at 0
         if current_pos < set_position:
             set_position = current_pos
 
@@ -144,6 +165,7 @@ class S3IndentationController:
                 elif case_selection == 1:
                     direction_sign = 1 if flag_direction else -1
                     delta_steps = self.state.advance_steps * direction_sign
+                    start_pos = current_pos
                     set_position = current_pos + delta_steps
 
                     action_label = "Advancing (Load)" if flag_direction else "Retracting (Unload)"
@@ -157,7 +179,12 @@ class S3IndentationController:
 
                     num_comd += 1
                     if self.state.dwell_time_s > 0:
-                        self._safe_wait_with_daq_polling(self.state.dwell_time_s, start_time)
+                        self._safe_wait_with_daq_polling(
+                            duration_s=self.state.dwell_time_s,
+                            start_time=start_time,
+                            start_pos_steps=start_pos,
+                            target_pos_steps=set_position,
+                        )
 
                     case_selection = 0
                     time.sleep(0.050)
