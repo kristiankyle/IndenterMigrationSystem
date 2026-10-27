@@ -65,7 +65,7 @@ class S3IndentationController:
             remaining = end_time - time.time()
             time.sleep(min(0.100, max(0.0, remaining)))
 
-    def run_s3_sequence(self, init_poll_iterations: int = 20) -> None:
+    def run_s3_sequence(self, init_poll_iterations: int = 5) -> None:
         if not self.state.s1_configured:
             raise RuntimeError("S1 parameters must be configured before running S3.")
 
