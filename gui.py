@@ -1,6 +1,8 @@
 """
 gui.py
 Unified Operator GUI replacing the legacy LabVIEW S1 -> S4 Front Panels.
+Includes embedded Real-Time Waveform Charts (Displacement vs. Time, Force vs. Time)
+and Real-Time X-Y Plot (Displacement vs. Force) updating at 100 ms intervals.
 """
 
 import queue
@@ -9,8 +11,11 @@ import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
+
 import config
-from daq_interface import DAQCommunicationError, ForceOverloadError, ForceSensorDAQ
+from daq_interface import ForceOverloadError, ForceSensorDAQ
 from motor_interface import (
     MotorCommunicationError,
     MotorSafetyLimitError,
@@ -24,23 +29,21 @@ from s3_indentation_controller import S3IndentationController
 from s4_graph_and_export import (
     calculate_stiffness_and_modulus,
     export_s4_spreadsheets,
-    plot_s4_graphs,
 )
 from state import GlobalSystemState
 
 
 class IndenterOperatorGUI:
     """
-    Complete operator interface for S1 Parameter Setup, S2 Motor Speed Configuration,
-    Load Cell Tare/Calibration, Manual Motor Positioning, S3 Automated Indentation,
-    Emergency Stop, and S4 Young's Modulus Graphing & Spreadsheet Export.
+    Complete operator interface with real-time embedded LabVIEW-style Waveform Charts
+    and X-Y Plot for S1 -> S4 operation.
     """
 
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("Python Indenter Control System (S1 - S4 Replacement)")
-        self.root.geometry("920x740")
-        self.root.configure(padx=12, pady=12)
+        self.root.title("Python Indenter Control System (Real-Time S1 - S4 LabVIEW Replacement)")
+        self.root.geometry("1260x800")
+        self.root.configure(padx=10, pady=10)
 
         # Shared system state & hardware controllers
         self.state = GlobalSystemState()
@@ -50,188 +53,182 @@ class IndenterOperatorGUI:
         self.s3_thread: threading.Thread = None
         self.is_s3_running: bool = False
         self.is_live_monitoring: bool = False
+        self.live_monitor_start_t: float = 0.0
         self.log_queue: queue.Queue = queue.Queue()
 
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
-        # Start 100 ms UI refresh timer
+        # Start 100 ms real-time UI & Waveform Chart refresh timer (matches S4 100ms timer)
         self.root.after(100, self._periodic_ui_refresh)
 
     def _build_ui(self) -> None:
-        # --- Top Title Banner ---
-        header = tk.Label(
-            self.root,
-            text="Mechanical Indenter Control & Force Acquisition System",
-            font=("Helvetica", 16, "bold"),
-        )
-        header.pack(pady=(0, 8))
-
-        # --- Digital Live Telemetry Display ---
-        telemetry_frame = tk.Frame(self.root, bg="black", bd=4, relief="sunken")
-        telemetry_frame.pack(fill=tk.X, pady=(0, 10))
+        # --- Top Digital Telemetry Banner ---
+        telemetry_frame = tk.Frame(self.root, bg="black", bd=3, relief="sunken")
+        telemetry_frame.pack(fill=tk.X, pady=(0, 8))
 
         self.lbl_live_force = tk.Label(
             telemetry_frame,
             text="Force: 0.0 g",
-            font=("Helvetica", 32, "bold"),
+            font=("Helvetica", 28, "bold"),
             fg="lime",
             bg="black",
         )
-        self.lbl_live_force.pack(side=tk.LEFT, expand=True, pady=8)
+        self.lbl_live_force.pack(side=tk.LEFT, expand=True, pady=6)
 
         self.lbl_live_pos = tk.Label(
             telemetry_frame,
             text="Pos: 0 steps (0.000 mm)",
-            font=("Helvetica", 22, "bold"),
+            font=("Helvetica", 20, "bold"),
             fg="#00d4ff",
             bg="black",
         )
-        self.lbl_live_pos.pack(side=tk.LEFT, expand=True, pady=8)
+        self.lbl_live_pos.pack(side=tk.LEFT, expand=True, pady=6)
 
         self.lbl_live_voltage = tk.Label(
             telemetry_frame,
             text="DAQ: 0.00000 V | Tare: Not Locked",
-            font=("Consolas", 12),
+            font=("Consolas", 11),
             fg="white",
             bg="black",
         )
-        self.lbl_live_voltage.pack(side=tk.RIGHT, padx=15, pady=8)
+        self.lbl_live_voltage.pack(side=tk.RIGHT, padx=15, pady=6)
 
-        # --- Middle 2-Column Container ---
-        mid_frame = tk.Frame(self.root)
-        mid_frame.pack(fill=tk.BOTH, expand=False, pady=4)
+        # --- Main Horizontal Split: Left Controls | Right Real-Time Waveform Charts ---
+        main_pane = tk.Frame(self.root)
+        main_pane.pack(fill=tk.BOTH, expand=True)
 
-        left_col = tk.Frame(mid_frame)
-        left_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 6))
+        left_col = tk.Frame(main_pane, width=460)
+        left_col.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 8))
+        left_col.pack_propagate(False)
 
-        right_col = tk.Frame(mid_frame)
-        right_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(6, 0))
+        right_col = tk.Frame(main_pane)
+        right_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         # =====================================================================
-        # LEFT COLUMN 1: Hardware Connection & Load Cell Calibration
+        # LEFT COLUMN: 1. Hardware & Calibration
         # =====================================================================
-        hw_box = ttk.LabelFrame(left_col, text="1. Hardware & Load Cell Calibration", padding=10)
-        hw_box.pack(fill=tk.X, pady=(0, 8))
+        hw_box = ttk.LabelFrame(left_col, text="1. Hardware & Load Cell Calibration", padding=8)
+        hw_box.pack(fill=tk.X, pady=(0, 6))
 
         row0 = tk.Frame(hw_box)
         row0.pack(fill=tk.X, pady=2)
-        tk.Label(row0, text="Motor Port:").pack(side=tk.LEFT)
-        self.ent_com = tk.Entry(row0, width=8)
+        tk.Label(row0, text="COM:").pack(side=tk.LEFT)
+        self.ent_com = tk.Entry(row0, width=7)
         self.ent_com.insert(0, config.DEFAULT_COM_PORT)
-        self.ent_com.pack(side=tk.LEFT, padx=4)
+        self.ent_com.pack(side=tk.LEFT, padx=3)
 
-        tk.Label(row0, text="DAQ Chan:").pack(side=tk.LEFT, padx=(8, 0))
-        self.ent_daq = tk.Entry(row0, width=10)
+        tk.Label(row0, text="DAQ:").pack(side=tk.LEFT, padx=(6, 0))
+        self.ent_daq = tk.Entry(row0, width=9)
         self.ent_daq.insert(0, config.DEFAULT_DAQ_CHANNEL)
-        self.ent_daq.pack(side=tk.LEFT, padx=4)
+        self.ent_daq.pack(side=tk.LEFT, padx=3)
 
-        tk.Label(row0, text="Factor (g/V):").pack(side=tk.LEFT, padx=(8, 0))
-        self.ent_factor = tk.Entry(row0, width=9)
+        tk.Label(row0, text="g/V:").pack(side=tk.LEFT, padx=(6, 0))
+        self.ent_factor = tk.Entry(row0, width=8)
         self.ent_factor.insert(0, f"{config.CALIBRATED_GRAMS_PER_VOLT:.2f}")
-        self.ent_factor.pack(side=tk.LEFT, padx=4)
+        self.ent_factor.pack(side=tk.LEFT, padx=3)
 
         cal_btn_row = tk.Frame(hw_box)
-        cal_btn_row.pack(fill=tk.X, pady=(8, 2))
+        cal_btn_row.pack(fill=tk.X, pady=(6, 2))
 
         self.btn_tare = tk.Button(
             cal_btn_row,
-            text="Zero / Tare Baseline (Dev1/ai1)",
+            text="Zero / Tare Baseline",
             bg="#e0e0e0",
-            font=("Helvetica", 10, "bold"),
+            font=("Helvetica", 9, "bold"),
             command=self.action_tare_daq,
         )
         self.btn_tare.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=2)
 
         self.btn_cal_500g = tk.Button(
             cal_btn_row,
-            text="500g Reverse-Tare Calibrate",
+            text="500g Reverse-Tare Cal",
             bg="#e0e0e0",
-            font=("Helvetica", 10),
+            font=("Helvetica", 9),
             command=self.action_calibrate_500g,
         )
         self.btn_cal_500g.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=2)
 
         self.btn_live_monitor = tk.Button(
             hw_box,
-            text="Start Live Force Stream (Pre-Test Check)",
+            text="Start Live Force Waveform Stream (S3Acq_fource)",
             bg="#cce5ff",
-            font=("Helvetica", 10, "bold"),
+            font=("Helvetica", 9, "bold"),
             command=self.action_toggle_live_stream,
         )
-        self.btn_live_monitor.pack(fill=tk.X, pady=(6, 0))
+        self.btn_live_monitor.pack(fill=tk.X, pady=(4, 0))
 
         # =====================================================================
-        # LEFT COLUMN 2: S1 Parameter Setting & S2 Speed Configuration
+        # LEFT COLUMN: 2. S1 Parameter Setting & S2 Speed Configuration
         # =====================================================================
         s1_box = ttk.LabelFrame(
             left_col,
             text="2. Stage S1 & S2: Test Parameters & Motor Speed",
-            padding=10,
+            padding=8,
         )
-        s1_box.pack(fill=tk.X, pady=(0, 8))
+        s1_box.pack(fill=tk.X, pady=(0, 6))
 
         grid_f = tk.Frame(s1_box)
         grid_f.pack(fill=tk.X)
 
-        tk.Label(grid_f, text="前進距離 Advance (mm):").grid(row=0, column=0, sticky="w", pady=3)
-        self.ent_advance_mm = tk.Entry(grid_f, width=10)
+        tk.Label(grid_f, text="前進距離 Advance (mm):").grid(row=0, column=0, sticky="w", pady=2)
+        self.ent_advance_mm = tk.Entry(grid_f, width=9)
         self.ent_advance_mm.insert(0, str(config.DEFAULT_ADVANCE_MM))
-        self.ent_advance_mm.grid(row=0, column=1, padx=6, pady=3)
+        self.ent_advance_mm.grid(row=0, column=1, padx=4, pady=2)
 
-        tk.Label(grid_f, text="上升時間 Rise Time (s):").grid(row=1, column=0, sticky="w", pady=3)
-        self.ent_rise_s = tk.Entry(grid_f, width=10)
+        tk.Label(grid_f, text="上升時間 Rise Time (s):").grid(row=0, column=2, sticky="w", padx=(8, 0), pady=2)
+        self.ent_rise_s = tk.Entry(grid_f, width=7)
         self.ent_rise_s.insert(0, str(config.DEFAULT_RISE_TIME_S))
-        self.ent_rise_s.grid(row=1, column=1, padx=6, pady=3)
+        self.ent_rise_s.grid(row=0, column=3, padx=4, pady=2)
 
-        tk.Label(grid_f, text="停留時間 Dwell Time (s):").grid(row=2, column=0, sticky="w", pady=3)
-        self.ent_dwell_s = tk.Entry(grid_f, width=10)
+        tk.Label(grid_f, text="停留時間 Dwell Time (s):").grid(row=1, column=0, sticky="w", pady=2)
+        self.ent_dwell_s = tk.Entry(grid_f, width=9)
         self.ent_dwell_s.insert(0, str(config.DEFAULT_DWELL_TIME_S))
-        self.ent_dwell_s.grid(row=2, column=1, padx=6, pady=3)
+        self.ent_dwell_s.grid(row=1, column=1, padx=4, pady=2)
 
-        tk.Label(grid_f, text="重複次數 Cycles:").grid(row=3, column=0, sticky="w", pady=3)
-        self.ent_cycles = tk.Entry(grid_f, width=10)
+        tk.Label(grid_f, text="重複次數 Cycles:").grid(row=1, column=2, sticky="w", padx=(8, 0), pady=2)
+        self.ent_cycles = tk.Entry(grid_f, width=7)
         self.ent_cycles.insert(0, str(config.DEFAULT_REPEAT_CYCLES))
-        self.ent_cycles.grid(row=3, column=1, padx=6, pady=3)
+        self.ent_cycles.grid(row=1, column=3, padx=4, pady=2)
 
-        tk.Label(grid_f, text="Force Cutoff Limit (g):").grid(row=4, column=0, sticky="w", pady=3)
-        self.ent_max_force = tk.Entry(grid_f, width=10)
+        tk.Label(grid_f, text="Force Cutoff Limit (g):").grid(row=2, column=0, sticky="w", pady=2)
+        self.ent_max_force = tk.Entry(grid_f, width=9)
         self.ent_max_force.insert(0, str(config.MAX_SAFE_FORCE_GRAMS))
-        self.ent_max_force.grid(row=4, column=1, padx=6, pady=3)
+        self.ent_max_force.grid(row=2, column=1, padx=4, pady=2)
 
         self.lbl_s1_computed = tk.Label(
             s1_box,
             text="前進STEP: Not Set  |  速度參數: Not Set",
-            font=("Consolas", 10, "bold"),
+            font=("Consolas", 9, "bold"),
             fg="blue",
         )
-        self.lbl_s1_computed.pack(pady=6)
+        self.lbl_s1_computed.pack(pady=4)
 
         self.btn_s1_s2 = tk.Button(
             s1_box,
-            text="Set UP (Run S1 Math & Send S2 Speed @0SI to Motor)",
+            text="Set UP (Run S1 Math & Send S2 Speed @0SI)",
             bg="#d4edda",
-            font=("Helvetica", 10, "bold"),
+            font=("Helvetica", 9, "bold"),
             command=self.action_apply_s1_and_s2,
         )
         self.btn_s1_s2.pack(fill=tk.X)
 
         # =====================================================================
-        # RIGHT COLUMN 1: Manual Motor Controls (SubVIs)
+        # LEFT COLUMN: 3. Manual Motor Controls
         # =====================================================================
         manual_box = ttk.LabelFrame(
-            right_col,
+            left_col,
             text="3. Manual Stepper Motor Control (COM4 SubVIs)",
-            padding=10,
+            padding=8,
         )
-        manual_box.pack(fill=tk.X, pady=(0, 8))
+        manual_box.pack(fill=tk.X, pady=(0, 6))
 
         pos_row = tk.Frame(manual_box)
-        pos_row.pack(fill=tk.X, pady=3)
+        pos_row.pack(fill=tk.X, pady=2)
 
         self.btn_read_pos = tk.Button(
             pos_row,
-            text="Read Position (POSiReadout 'a')",
+            text="Read Pos (POSiReadout 'a')",
             command=self.action_read_motor_pos,
         )
         self.btn_read_pos.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=2)
@@ -244,97 +241,203 @@ class IndenterOperatorGUI:
         self.btn_home_1000.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=2)
 
         jog_row = tk.Frame(manual_box)
-        jog_row.pack(fill=tk.X, pady=4)
-        tk.Label(jog_row, text="Jog Steps:").pack(side=tk.LEFT)
-        self.ent_jog_steps = tk.Entry(jog_row, width=8)
+        jog_row.pack(fill=tk.X, pady=3)
+        tk.Label(jog_row, text="Steps:").pack(side=tk.LEFT)
+        self.ent_jog_steps = tk.Entry(jog_row, width=7)
         self.ent_jog_steps.insert(0, "400")
-        self.ent_jog_steps.pack(side=tk.LEFT, padx=4)
+        self.ent_jog_steps.pack(side=tk.LEFT, padx=3)
 
         self.btn_jog_up = tk.Button(
             jog_row,
-            text="Retract -Steps (@0U-)",
+            text="Retract - (@0U-)",
             command=lambda: self.action_jog(-1),
         )
         self.btn_jog_up.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=2)
 
         self.btn_jog_down = tk.Button(
             jog_row,
-            text="Advance +Steps (@0U+)",
+            text="Advance + (@0U+)",
             command=lambda: self.action_jog(1),
         )
         self.btn_jog_down.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=2)
 
         # =====================================================================
-        # RIGHT COLUMN 2: S3 Indentation Sequence & S4 Analysis
+        # LEFT COLUMN: 4. S3 Sequence & S4 Export
         # =====================================================================
         s3_box = ttk.LabelFrame(
-            right_col,
-            text="4. Stage S3 & S4: Automated Indentation & Analysis",
-            padding=10,
+            left_col,
+            text="4. Stage S3 & S4: Sequence Execution & Export",
+            padding=8,
         )
-        s3_box.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+        s3_box.pack(fill=tk.X, pady=(0, 6))
 
         self.btn_start_s3 = tk.Button(
             s3_box,
             text="START S3 INDENTATION SEQUENCE",
             bg="#28a745",
             fg="white",
-            font=("Helvetica", 12, "bold"),
+            font=("Helvetica", 11, "bold"),
             height=2,
             command=self.action_start_s3,
         )
-        self.btn_start_s3.pack(fill=tk.X, pady=4)
+        self.btn_start_s3.pack(fill=tk.X, pady=3)
 
         stop_row = tk.Frame(s3_box)
-        stop_row.pack(fill=tk.X, pady=4)
+        stop_row.pack(fill=tk.X, pady=3)
 
         self.btn_stop_s3 = tk.Button(
             stop_row,
             text="Stop Sequence",
             bg="#ffc107",
-            font=("Helvetica", 11, "bold"),
+            font=("Helvetica", 10, "bold"),
             command=self.action_request_stop,
         )
-        self.btn_stop_s3.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 4))
+        self.btn_stop_s3.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 3))
 
         self.btn_estop = tk.Button(
             stop_row,
             text="EMERGENCY STOP",
             bg="#dc3545",
             fg="white",
-            font=("Helvetica", 11, "bold"),
+            font=("Helvetica", 10, "bold"),
             command=self.action_emergency_stop,
         )
-        self.btn_estop.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(4, 0))
+        self.btn_estop.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(3, 0))
 
         self.btn_s4_export = tk.Button(
             s3_box,
-            text="Stage S4: Plot Young's Graph & Export Spreadsheets",
+            text="Stage S4: Export LabVIEW Raw (.txt) & Calibrated (.csv)",
             bg="#cce5ff",
-            font=("Helvetica", 11, "bold"),
-            height=2,
+            font=("Helvetica", 9, "bold"),
             command=self.action_run_s4,
         )
-        self.btn_s4_export.pack(fill=tk.X, pady=(8, 2))
+        self.btn_s4_export.pack(fill=tk.X, pady=(4, 2))
 
         self.lbl_s4_summary = tk.Label(
             s3_box,
-            text="Recorded Samples: 0 | Stiffness: -- g/mm | E: -- kPa",
-            font=("Consolas", 10),
+            text="Samples: 0 | Stiffness: -- g/mm | E: -- kPa",
+            font=("Consolas", 9),
         )
-        self.lbl_s4_summary.pack(pady=4)
+        self.lbl_s4_summary.pack(pady=2)
 
-        # --- Bottom Status & Error Log ---
-        log_box = ttk.LabelFrame(self.root, text="System Status & Hardware Log", padding=6)
+        # --- Left Bottom Log ---
+        log_box = ttk.LabelFrame(left_col, text="System Status & Hardware Log", padding=4)
         log_box.pack(fill=tk.BOTH, expand=True)
 
-        self.txt_log = tk.Text(log_box, height=8, font=("Consolas", 9), state=tk.DISABLED)
+        self.txt_log = tk.Text(log_box, height=8, font=("Consolas", 8), state=tk.DISABLED)
         self.txt_log.pack(fill=tk.BOTH, expand=True)
 
-        self.enqueue_log("System initialized. Configure S1/S2 and Tare Load Cell before running S3.")
+        # =====================================================================
+        # RIGHT COLUMN: Embedded Real-Time LabVIEW Waveform Charts (Tab Control)
+        # =====================================================================
+        self.notebook = ttk.Notebook(right_col)
+        self.notebook.pack(fill=tk.BOTH, expand=True)
+
+        # --- TAB 1: Chart of Force & Displacement vs. Time (Screenshot 15) ---
+        self.tab_time_chart = tk.Frame(self.notebook, bg="#d9d9d9")
+        self.notebook.add(
+            self.tab_time_chart,
+            text="  Chart (Real-Time Force & Displacement Waveform)  ",
+        )
+
+        self.fig_time = Figure(figsize=(7.2, 6.2), dpi=95, facecolor="#2b2b2b")
+        self.ax_disp = self.fig_time.add_subplot(211)
+        self.ax_force = self.fig_time.add_subplot(212)
+        self._style_time_axes()
+
+        (self.line_disp,) = self.ax_disp.plot([], [], color="white", linewidth=1.8)
+        (self.line_force,) = self.ax_force.plot([], [], color="#ff3333", linewidth=1.8)
+
+        self.fig_time.tight_layout(pad=2.0)
+        self.canvas_time = FigureCanvasTkAgg(self.fig_time, master=self.tab_time_chart)
+        self.canvas_time.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        # --- TAB 2: X-Y Plot: Displacement vs. Force (Screenshot 16) ---
+        self.tab_xy_plot = tk.Frame(self.notebook, bg="#d9d9d9")
+        self.notebook.add(
+            self.tab_xy_plot,
+            text="  X-Y Plot (Real-Time X vs. Force)  ",
+        )
+
+        self.fig_xy = Figure(figsize=(7.2, 6.2), dpi=95, facecolor="#2b2b2b")
+        self.ax_xy = self.fig_xy.add_subplot(111)
+        self._style_xy_axis()
+
+        (self.line_xy,) = self.ax_xy.plot(
+            [], [], color="lime", marker="s", markersize=3, linewidth=1.5
+        )
+
+        self.fig_xy.tight_layout(pad=2.0)
+        self.canvas_xy = FigureCanvasTkAgg(self.fig_xy, master=self.tab_xy_plot)
+        self.canvas_xy.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        self.enqueue_log(
+            "System ready. Real-time Waveform Chart & X-Y Plot active."
+        )
+
+    def _style_time_axes(self) -> None:
+        self.ax_disp.set_facecolor("black")
+        self.ax_disp.set_title(
+            "Chart of Force & Displacement (Real-Time Waveform)",
+            color="white",
+            fontsize=11,
+            fontweight="bold",
+        )
+        self.ax_disp.set_ylabel("Displacement (steps)", color="white")
+        self.ax_disp.tick_params(colors="white")
+        self.ax_disp.grid(True, color="#444444", linestyle="--")
+
+        self.ax_force.set_facecolor("black")
+        self.ax_force.set_xlabel("Time (s)", color="white")
+        self.ax_force.set_ylabel("Force (g)", color="white")
+        self.ax_force.tick_params(colors="white")
+        self.ax_force.grid(True, color="#444444", linestyle="--")
+
+    def _style_xy_axis(self) -> None:
+        self.ax_xy.set_facecolor("black")
+        self.ax_xy.set_title(
+            "X vs. Force (Real-Time X-Y Plot)",
+            color="white",
+            fontsize=11,
+            fontweight="bold",
+        )
+        self.ax_xy.set_xlabel("Displacement (mm)", color="white")
+        self.ax_xy.set_ylabel("Force (g)", color="white")
+        self.ax_xy.tick_params(colors="white")
+        self.ax_xy.grid(True, color="#888800", linestyle="-", alpha=0.6)
+
+    def _refresh_realtime_charts(self) -> None:
+        """
+        Updates the embedded Waveform Charts and X-Y Plot in real time
+        using the latest samples in GlobalSystemState.
+        """
+        with self.state._lock:
+            t_arr = list(self.state.history_timestamp_s)
+            pos_arr = list(self.state.history_position_steps)
+            disp_arr = list(self.state.history_displacement_mm)
+            force_arr = list(self.state.history_force_g)
+
+        if not t_arr:
+            return
+
+        # Update Tab 1: Displacement vs Time & Force vs Time
+        self.line_disp.set_data(t_arr, pos_arr)
+        self.ax_disp.relim()
+        self.ax_disp.autoscale_view()
+
+        self.line_force.set_data(t_arr, force_arr)
+        self.ax_force.relim()
+        self.ax_force.autoscale_view()
+        self.canvas_time.draw_idle()
+
+        # Update Tab 2: Displacement (mm) vs Force (g)
+        self.line_xy.set_data(disp_arr, force_arr)
+        self.ax_xy.relim()
+        self.ax_xy.autoscale_view()
+        self.canvas_xy.draw_idle()
 
     # =========================================================================
-    # Logging & Periodic UI Refresh
+    # Logging & 100 ms Periodic UI / Waveform Refresh
     # =========================================================================
     def enqueue_log(self, message: str) -> None:
         timestamp = time.strftime("%H:%M:%S")
@@ -349,19 +452,26 @@ class IndenterOperatorGUI:
             self.txt_log.see(tk.END)
             self.txt_log.config(state=tk.DISABLED)
 
-        # 2. If standalone live force monitor is active (outside S3), poll DAQ
+        # 2. If standalone Live Force Stream is active, poll DAQ and record to waveform
         if self.is_live_monitoring and not self.is_s3_running:
             try:
-                self.daq.read_live_force(check_safety=False)
+                v_now, f_now = self.daq.read_live_force(check_safety=False)
+                elapsed = time.time() - self.live_monitor_start_t
+                self.state.record_sample(
+                    elapsed_s=elapsed,
+                    pos_steps=self.state.stepper_position_steps,
+                    voltage_v=v_now,
+                    force_g=f_now,
+                )
             except Exception as exc:
                 self.is_live_monitoring = False
                 self.daq.stop_continuous_stream()
                 self.btn_live_monitor.config(
-                    text="Start Live Force Stream (Pre-Test Check)", bg="#cce5ff"
+                    text="Start Live Force Waveform Stream (S3Acq_fource)", bg="#cce5ff"
                 )
                 self.enqueue_log(f"[DAQ Stream Error] {exc}")
 
-        # 3. Refresh digital telemetry labels from GlobalSystemState
+        # 3. Refresh digital telemetry banner
         pos_steps = self.state.stepper_position_steps
         pos_mm = pos_steps / config.STEPS_PER_MM
         self.lbl_live_force.config(text=f"Force: {self.state.force_loadcell_g:.1f} g")
@@ -372,6 +482,10 @@ class IndenterOperatorGUI:
             text=f"DAQ: {self.state.force_loadcell_v:.5f} V | Tare: {tare_txt}"
         )
 
+        # 4. Redraw real-time Waveform Chart & X-Y Plot whenever streaming or running S3
+        if self.is_live_monitoring or self.is_s3_running:
+            self._refresh_realtime_charts()
+
         self.root.after(100, self._periodic_ui_refresh)
 
     def _sync_hw_settings_from_ui(self) -> None:
@@ -381,7 +495,7 @@ class IndenterOperatorGUI:
         config.MAX_SAFE_FORCE_GRAMS = float(self.ent_max_force.get().strip())
 
     # =========================================================================
-    # Button Actions
+    # Operator Actions
     # =========================================================================
     def action_tare_daq(self) -> None:
         if self.is_s3_running:
@@ -411,7 +525,7 @@ class IndenterOperatorGUI:
                     "Step 1 Required",
                     "First hang the 500g weight, press ZERO on the UAB-3000, "
                     "and click 'Zero / Tare Baseline'.\n\n"
-                    "Then remove the 500g weight and click '500g Reverse-Tare Calibrate'.",
+                    "Then remove the 500g weight and click '500g Reverse-Tare Cal'.",
                 )
                 return
             factor = self.daq.calibrate_with_weight(499.0)
@@ -434,12 +548,14 @@ class IndenterOperatorGUI:
                 self._sync_hw_settings_from_ui()
                 if not self.state.is_tared:
                     self.daq.tare_baseline()
+                self.state.clear_history()
+                self.live_monitor_start_t = time.time()
                 self.daq.start_continuous_stream()
                 self.is_live_monitoring = True
                 self.btn_live_monitor.config(
-                    text="Stop Live Force Stream", bg="#ffc107"
+                    text="Stop Live Force Waveform Stream", bg="#ffc107"
                 )
-                self.enqueue_log("[Live Monitor] Continuous DAQ force stream started.")
+                self.enqueue_log("[Live Monitor] Real-time DAQ waveform stream started.")
             except Exception as exc:
                 self.enqueue_log(f"[Live Monitor Error] {exc}")
                 messagebox.showerror("DAQ Error", str(exc))
@@ -447,9 +563,9 @@ class IndenterOperatorGUI:
             self.is_live_monitoring = False
             self.daq.stop_continuous_stream()
             self.btn_live_monitor.config(
-                text="Start Live Force Stream (Pre-Test Check)", bg="#cce5ff"
+                text="Start Live Force Waveform Stream (S3Acq_fource)", bg="#cce5ff"
             )
-            self.enqueue_log("[Live Monitor] Continuous DAQ force stream stopped.")
+            self.enqueue_log("[Live Monitor] Real-time DAQ waveform stream stopped.")
 
     def action_apply_s1_and_s2(self) -> None:
         if self.is_s3_running:
@@ -476,14 +592,18 @@ class IndenterOperatorGUI:
                 f"速度參數={res['速度參數']} steps/s, Cycles={res['重複次數']}"
             )
 
-            # Immediately execute S2_Motor_Set speed2015.vi over COM4
             self.motor.connect()
             cmd = self.motor.set_speed_s2()
             pos = self.motor.read_position()
             self.enqueue_log(
                 f"[S2 Configured] Sent {cmd.strip()} to {self.state.com_port} | Pos={pos} steps"
             )
-        except (ParameterValidationError, MotorSafetyLimitError, MotorCommunicationError, ValueError) as exc:
+        except (
+            ParameterValidationError,
+            MotorSafetyLimitError,
+            MotorCommunicationError,
+            ValueError,
+        ) as exc:
             self.enqueue_log(f"[S1/S2 Error] {exc}")
             messagebox.showerror("S1 / S2 Configuration Error", str(exc))
 
@@ -546,11 +666,11 @@ class IndenterOperatorGUI:
             self.is_live_monitoring = False
             self.daq.stop_continuous_stream()
             self.btn_live_monitor.config(
-                text="Start Live Force Stream (Pre-Test Check)", bg="#cce5ff"
+                text="Start Live Force Waveform Stream (S3Acq_fource)", bg="#cce5ff"
             )
 
         self.is_s3_running = True
-        self.btn_start_s3.config(state=tk.DISABLED, text="S3 RUNNING...")
+        self.btn_start_s3.config(state=tk.DISABLED, text="S3 RUNNING (LIVE WAVEFORM)...")
 
         self.s3_thread = threading.Thread(target=self._s3_worker, daemon=True)
         self.s3_thread.start()
@@ -563,7 +683,7 @@ class IndenterOperatorGUI:
             status_callback=self.enqueue_log,
         )
         try:
-            controller.run_s3_sequence()
+            controller.run_s3_sequence(init_poll_iterations=5)
             n_pts = len(self.state.history_position_steps)
             metrics = calculate_stiffness_and_modulus(self.state)
             self.enqueue_log(
@@ -571,9 +691,12 @@ class IndenterOperatorGUI:
                 f"Stiffness={metrics['stiffness_g_per_mm']:.2f} g/mm"
             )
             self.root.after(0, self._update_s4_summary_label)
+            self.root.after(0, self._refresh_realtime_charts)
         except ForceOverloadError as exc:
             self.enqueue_log(f"[FORCE OVERLOAD CUTOFF] {exc}")
-            self.root.after(0, lambda: messagebox.showerror("Force Overload Cutoff", str(exc)))
+            self.root.after(
+                0, lambda: messagebox.showerror("Force Overload Cutoff", str(exc))
+            )
         except Exception as exc:
             self.enqueue_log(f"[S3 Execution Error] {exc}")
             self.root.after(0, lambda: messagebox.showerror("S3 Error", str(exc)))
@@ -591,7 +714,7 @@ class IndenterOperatorGUI:
         metrics = calculate_stiffness_and_modulus(self.state)
         self.lbl_s4_summary.config(
             text=(
-                f"Recorded Samples: {n_pts} | "
+                f"Samples: {n_pts} | "
                 f"Stiffness: {metrics['stiffness_g_per_mm']:.2f} g/mm | "
                 f"E: {metrics['youngs_modulus_kpa']:.2f} kPa"
             )
@@ -617,13 +740,17 @@ class IndenterOperatorGUI:
         try:
             raw_file, csv_file = export_s4_spreadsheets(self.state)
             self._update_s4_summary_label()
+            self._refresh_realtime_charts()
             self.enqueue_log(
                 f"[S4 Exported] LabVIEW Raw: {raw_file} | Calibrated CSV: {csv_file}"
             )
-            plot_s4_graphs(self.state)
+            messagebox.showinfo(
+                "S4 Data Exported",
+                f"Saved files:\n1. {raw_file}\n2. {csv_file}",
+            )
         except Exception as exc:
             self.enqueue_log(f"[S4 Error] {exc}")
-            messagebox.showerror("S4 Export/Plot Error", str(exc))
+            messagebox.showerror("S4 Export Error", str(exc))
 
     def on_close(self) -> None:
         self.state.stop_requested = True
