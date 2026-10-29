@@ -1,10 +1,3 @@
-"""
-s3_indentation_controller.py
-Replaces LabVIEW 'S3Motor_control2017m.vi' (Screenshots 13, 14, and Case 0/1/2).
-Keeps COM4 quiet during Case 1 Frame 2 movement while smoothly interpolating
-live stepper position from speed_parameter so the X-Y Hysteresis Loop and
-Stiffness (g/mm) calculation are accurately synchronized.
-"""
 
 import time
 from typing import Callable, Optional
