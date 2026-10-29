@@ -1,12 +1,10 @@
 """
 motor_interface.py
 Replaces LabVIEW Motor VIs using LabVIEW's exact per-SubVI lifecycle:
-  VISA Configure Serial Port -> VISA Write (/ Read) -> VISA Close
-References:
-  - S2_Motor_Set speed2015.vi (@0SI<speed>,\r\n)
-  - motor absposi(SubVI).vi (@0X<steps>\r\n)
-  - motorposi(SubVI).vi (@0U<steps>\r\n)
-  - POSiReadout.vi ("a\r\n" -> wait 100ms -> read 10 bytes -> parse from index 1)
+  - S2_Motor_Set speed2015.vi : "@0SI<speed>,\r\n" & "@0SI<speed>,<speed>,<speed>\r\n"
+  - motor absposi(SubVI).vi   : "@0X<steps>\r\n" (NO trailing comma)
+  - motorposi(SubVI).vi       : "@0U<steps>\r\n" (NO trailing comma)
+  - POSiReadout.vi            : "a\r\n" -> wait 100ms -> read 10 bytes -> parse from index 1
 """
 
 import re
@@ -30,7 +28,7 @@ class MotorSafetyLimitError(ValueError):
 
 class StepperMotorController:
     """
-    Real hardware interface for the TL3T stepper motor controller on COM4 (9600 baud).
+    Hardware interface for the TL3T stepper motor controller on COM4 (9600 baud).
     Reproduces LabVIEW's exact SubVI open -> write/read -> close behavior.
     """
 
@@ -38,19 +36,27 @@ class StepperMotorController:
         self.state = state
         self.ser: Optional[serial.Serial] = None
 
+    def _open_port(self) -> serial.Serial:
+        """Opens COM4 cleanly with DTR/RTS handshaking disabled."""
+        ser = serial.Serial()
+        ser.port = self.state.com_port
+        ser.baudrate = self.state.baud_rate
+        ser.bytesize = serial.EIGHTBITS
+        ser.parity = serial.PARITY_NONE
+        ser.stopbits = serial.STOPBITS_ONE
+        ser.timeout = config.SERIAL_TIMEOUT_S
+        ser.write_timeout = config.SERIAL_TIMEOUT_S
+        ser.xonxoff = False
+        ser.rtscts = False
+        ser.dsrdtr = False
+        ser.open()
+        return ser
+
     def connect(self) -> None:
         """Verifies that the serial port can be opened cleanly."""
         try:
-            with serial.Serial(
-                port=self.state.com_port,
-                baudrate=self.state.baud_rate,
-                bytesize=serial.EIGHTBITS,
-                parity=serial.PARITY_NONE,
-                stopbits=serial.STOPBITS_ONE,
-                timeout=config.SERIAL_TIMEOUT_S,
-                write_timeout=config.SERIAL_TIMEOUT_S,
-            ) as _:
-                pass
+            ser = self._open_port()
+            ser.close()
         except serial.SerialException as exc:
             raise MotorCommunicationError(
                 f"Failed to open serial port {self.state.com_port} at "
@@ -70,25 +76,20 @@ class StepperMotorController:
             finally:
                 self.ser = None
 
-    def _visa_write_transaction(self, ascii_cmd: str) -> None:
+    def _visa_write_transaction(self, ascii_cmd: str, post_delay_s: float = 0.06) -> None:
         """
         Replaces LabVIEW's exact SubVI pattern:
           VISA Configure Serial Port (9600) -> VISA Write -> VISA Close
         """
         try:
-            with serial.Serial(
-                port=self.state.com_port,
-                baudrate=self.state.baud_rate,
-                bytesize=serial.EIGHTBITS,
-                parity=serial.PARITY_NONE,
-                stopbits=serial.STOPBITS_ONE,
-                timeout=config.SERIAL_TIMEOUT_S,
-                write_timeout=config.SERIAL_TIMEOUT_S,
-            ) as ser:
+            ser = self._open_port()
+            try:
                 ser.write(ascii_cmd.encode("ascii"))
                 ser.flush()
-                # Wait briefly before VISA Close so UART finishes shifting all bits out
-                time.sleep(0.05)
+                time.sleep(post_delay_s)
+            finally:
+                ser.close()
+            time.sleep(0.04)
         except serial.SerialException as exc:
             raise MotorCommunicationError(
                 f"Serial write failed while sending {ascii_cmd!r} on {self.state.com_port}: {exc}"
@@ -99,9 +100,7 @@ class StepperMotorController:
     # =========================================================================
     def set_speed_s2(self, speed_steps_per_s: Optional[int] = None) -> str:
         """
-        Replaces S2_Motor_Set speed2015.vi (Image 10 in Block Diagrams.docx):
-        Concatenates: "@0SI" + dec_string(速度參數) + "," + "\r" + "\n"
-        Also sends "@0SI<spd>,<spd>,<spd>\r\n" from Speed setup.vi (Image 18) for compatibility.
+        Sends "@0SI<speed>,\r\n" and "@0SI<speed>,<speed>,<speed>\r\n".
         """
         if speed_steps_per_s is None:
             if not self.state.s1_configured:
@@ -117,15 +116,11 @@ class StepperMotorController:
                 f"(1 to {config.MAX_SAFE_SPEED_STEPS_S} steps/s)."
             )
 
-        # Exact S2_Motor_Set speed2015.vi Block Diagram string (Image 10): "@0SI1600,\r\n"
         cmd_s2 = f"@0SI{speed_int},\r\n"
         self._visa_write_transaction(cmd_s2)
-        time.sleep(0.05)
 
-        # Also send 3-parameter form from Speed setup.vi (Image 18)
         cmd_3axis = f"@0SI{speed_int},{speed_int},{speed_int}\r\n"
         self._visa_write_transaction(cmd_3axis)
-        time.sleep(0.05)
         return cmd_s2
 
     # =========================================================================
@@ -133,8 +128,8 @@ class StepperMotorController:
     # =========================================================================
     def move_absolute(self, target_steps: int) -> str:
         """
-        Replaces motor absposi(SubVI).vi (Image 2 in Block Diagrams.docx).
-        Concatenates: "@0X" + dec_string(前進STEP) + "\r" + "\n"
+        Replaces motor absposi(SubVI).vi.
+        Concatenates: "@0X" + dec_string(target_steps) + "\r\n" (NO comma).
         """
         if self.state.emergency_stop_triggered:
             raise MotorSafetyLimitError("Movement blocked: Emergency Stop is active.")
@@ -147,7 +142,7 @@ class StepperMotorController:
             )
 
         cmd_str = f"@0X{target_int}\r\n"
-        self._visa_write_transaction(cmd_str)
+        self._visa_write_transaction(cmd_str, post_delay_s=0.08)
         return cmd_str
 
     # =========================================================================
@@ -155,23 +150,22 @@ class StepperMotorController:
     # =========================================================================
     def move_relative(self, delta_steps: int) -> str:
         """
-        Replaces motorposi(SubVI).vi (Image 4 in Block Diagrams.docx).
-        Concatenates: "@0U" + dec_string(前進STEP) + "\r" + "\n"
+        Replaces motorposi(SubVI).vi.
+        Concatenates: "@0U" + dec_string(delta_steps) + "\r\n" (NO comma).
+        Does not block retraction based on estimated software position.
         """
         if self.state.emergency_stop_triggered:
             raise MotorSafetyLimitError("Movement blocked: Emergency Stop is active.")
 
         delta_int = int(delta_steps)
-        projected_pos = self.state.stepper_position_steps + delta_int
-        if projected_pos < config.MIN_SAFE_STEPS or projected_pos > config.MAX_SAFE_STEPS:
+        if abs(delta_int) > config.MAX_SAFE_STEPS:
             raise MotorSafetyLimitError(
-                f"Relative move {delta_int} steps from {self.state.stepper_position_steps} "
-                f"would reach {projected_pos} steps, violating safe travel limits "
-                f"[{config.MIN_SAFE_STEPS}, {config.MAX_SAFE_STEPS}]."
+                f"Relative move {delta_int} steps exceeds maximum stroke limit "
+                f"({config.MAX_SAFE_STEPS} steps)."
             )
 
         cmd_str = f"@0U{delta_int}\r\n"
-        self._visa_write_transaction(cmd_str)
+        self._visa_write_transaction(cmd_str, post_delay_s=0.08)
         return cmd_str
 
     # =========================================================================
@@ -179,7 +173,7 @@ class StepperMotorController:
     # =========================================================================
     def read_position(self) -> int:
         """
-        Replaces POSiReadout.vi (Image 6 in Block Diagrams.docx):
+        Replaces POSiReadout.vi:
           Frame 0: VISA Configure Serial Port (9600) -> VISA Write("a\\r\\n")
           Frame 1: Wait 100 ms
           Right:   VISA Read(10 bytes) -> VISA Close -> Decimal String To Number (offset=1)
@@ -187,24 +181,17 @@ class StepperMotorController:
         last_error = None
         for attempt in range(1, 4):
             try:
-                with serial.Serial(
-                    port=self.state.com_port,
-                    baudrate=self.state.baud_rate,
-                    bytesize=serial.EIGHTBITS,
-                    parity=serial.PARITY_NONE,
-                    stopbits=serial.STOPBITS_ONE,
-                    timeout=config.SERIAL_TIMEOUT_S,
-                    write_timeout=config.SERIAL_TIMEOUT_S,
-                ) as ser:
+                ser = self._open_port()
+                try:
+                    ser.reset_input_buffer()
                     ser.write(b"a\r\n")
                     ser.flush()
-                    time.sleep(config.POS_READOUT_WAIT_S)  # 100 ms wait (Frame 1)
-                    raw_bytes = ser.read(config.POS_READOUT_BYTES)  # Read up to 10 bytes
+                    time.sleep(config.POS_READOUT_WAIT_S)  # 100 ms wait
+                    raw_bytes = ser.read(config.POS_READOUT_BYTES)
+                finally:
+                    ser.close()
 
                 raw_text = raw_bytes.decode("ascii", errors="ignore").strip()
-
-                # Exact LabVIEW Decimal String To Number with offset = 1:
-                # If string has no digits or is empty, LabVIEW returns default 0
                 substring = raw_text[1:] if len(raw_text) > 1 else raw_text
                 match = re.search(r"[-+]?\d+", substring)
                 if not match:
@@ -221,7 +208,7 @@ class StepperMotorController:
 
             except Exception as exc:
                 last_error = exc
-                time.sleep(0.05)
+                time.sleep(0.06)
 
         raise MotorCommunicationError(
             f"POSiReadout failed on {self.state.com_port}: {last_error}"
@@ -232,6 +219,6 @@ class StepperMotorController:
         self.state.emergency_stop_triggered = True
         self.state.stop_requested = True
         try:
-            self._visa_write_transaction("@0U0\r\n")
+            self._visa_write_transaction("@0U0\r\n", post_delay_s=0.05)
         except Exception:
             pass
