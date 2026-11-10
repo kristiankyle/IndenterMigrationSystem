@@ -99,12 +99,13 @@ class S3IndentationController:
 
     def _home_to_baseline(self, home_target: int, start_time: float) -> int:
         """
-        Ensures the motor physically returns to home_target (1000 steps) and comes
-        to a complete stop before Frame 2 begins.
+        Reads the current resting motor position and locks it as the cycle baseline
+        without drawing a false pre-test spike on the chart.
         """
-        pos_now = self._poll_motor_and_daq(start_time)
-        if abs(pos_now - home_target) <= 15:
-            return pos_now
+        time.sleep(0.15)
+        pos_now = self.motor.read_position()
+        self.state.stepper_position_steps = pos_now
+        return pos_now
 
         self._log(
             f"[S3 Init] Homing motor from {pos_now} steps to {home_target} steps..."
