@@ -1,9 +1,16 @@
 """
 s3_indentation_controller.py
 Replaces LabVIEW 'S3Motor_control2017m.vi' & 'S3Acq_fource_ai0.vi'.
-Recalibrated Frame 1 Initialization to match LabVIEW's exact N = 100 parallel
-loop timing (~12.5 seconds at 1000 steps) while preserving repeatable multi-cycle
-movement and smooth real-time displacement interpolation.
+Strictly mimics LabVIEW's exact control sequence and timing:
+  1. Frame 1 (Initialization):
+     - Sends @0X1000\r\n once (no @0U relative movement during initialization).
+     - Enforces the full N = 100 For Loop (~13.5 seconds stationary baseline
+       acquisition) even if gui.py passes an older init_poll_iterations=5 value.
+  2. Frame 2 (Main While Loop @ 50 ms):
+     - Case 0, Default: Polls POSiReadout & DAQ Force; checks target position.
+     - Case 1: Sends @0U<+/-Step>\r\n, updates Set position, flips flag_direction,
+       increments #of comd, and waits 停留時間(秒)*1000 ms with COM4 quiet.
+     - Case 2: Polls POSiReadout & DAQ Force until final retraction completes.
 """
 
 import time
@@ -15,15 +22,14 @@ from motor_interface import StepperMotorController
 from daq_interface import ForceSensorDAQ, ForceOverloadError
 
 
-# Exact LabVIEW Frame 1 For-Loop constants (Screenshot 14 of Block Diagrams.docx)
-LABVIEW_INIT_ITERATIONS: int = getattr(config, "INIT_POLL_ITERATIONS", 100)
-LABVIEW_INIT_PERIOD_S: float = getattr(config, "INIT_LOOP_PERIOD_S", 0.120)
+# Exact LabVIEW S3 Frame 1 For-Loop Constants (Screenshot 14 of Block Diagrams.docx)
+LABVIEW_FRAME1_ITERATIONS: int = 100
+LABVIEW_FRAME1_ITER_TARGET_S: float = 0.135  # 100 iters * 0.135s = ~13.5s (matches 138 rows in RUBIN16036AGM2)
 
 
 class S3IndentationController:
     """
-    Executes S3Motor_control2017m.vi + S3Acq_fource_ai0.vi workflow with
-    recalibrated LabVIEW Frame 1 initialization timing (N = 100, 120 ms period).
+    Executes the exact S3Motor_control2017m.vi + S3Acq_fource_ai0.vi sequence.
     """
 
     def __init__(
@@ -45,7 +51,10 @@ class S3IndentationController:
             print(message)
 
     def _poll_motor_and_daq(self, start_time: float) -> int:
-        """Polls hardware position ('a\\r\\n') and DAQ force in Frame 1, Case 0, and Case 2."""
+        """
+        Polls POSiReadout.vi ('a\\r\\n', 100 ms wait) and NI-DAQmx force.
+        Used in Frame 1, Case 0, and Case 2 where LabVIEW places POSiReadout.vi.
+        """
         pos_now = self.motor.read_position()
         v_now, f_now = self.daq.read_live_force(check_safety=True)
         self.state.record_sample(
@@ -64,10 +73,10 @@ class S3IndentationController:
         target_pos_steps: int,
     ) -> None:
         """
-        Replaces LabVIEW's Wait (ms) inside Case 1 Frame 2.
-        Keeps COM4 quiet during the stroke so the TL3T controller executes
-        @0U<delta> without serial interruption, while interpolating live
-        position for the real-time waveform and X-Y hysteresis plots.
+        Replaces LabVIEW's Wait (ms) inside Case 1 Frame 2 (停留時間(秒) * 1000).
+        Does NOT send 'a\\r\\n' to COM4 during this wait so the stepper controller
+        executes @0U<delta> uninterrupted, while sampling DAQ force every 100 ms
+        (matching S4_Youngs_Graph.vi's 100 ms chart loop).
         """
         t0 = time.time()
         end_time = t0 + duration_s
@@ -97,105 +106,28 @@ class S3IndentationController:
             if remaining > 0:
                 time.sleep(min(0.100, remaining))
 
-    def _run_labview_frame1_initialization(
-        self,
-        home_target: int,
-        start_time: float,
-        total_iterations: int = LABVIEW_INIT_ITERATIONS,
-        loop_period_s: float = LABVIEW_INIT_PERIOD_S,
-    ) -> int:
-        """
-        Reproduces LabVIEW's exact S3 Frame 1 initialization sequence and timing:
-          1. Moves motor to Set position = 1000 steps (@0X1000, with @0U fallback
-             if the controller is away from 1000 and in relative mode).
-          2. Runs the full N = 100 initialization loop using a deadline timer
-             (max(loop_period_s, poll_time) ~= 125 ms/iteration -> ~12.5 seconds total),
-             recording the 100 baseline samples at 1000 steps just like LabVIEW.
-        """
-        self._log(
-            f"[S3 Frame 1] Initializing motor to Set position = {home_target} steps "
-            f"(N={total_iterations} iterations @ {int(loop_period_s * 1000)} ms LabVIEW timing)..."
-        )
-
-        # Read starting position before homing
-        pos_init = self.motor.read_position()
-        completed_iters = 0
-
-        # Command @0X1000 (motor absposi(SubVI).vi) as in LabVIEW Frame 1
-        self.motor.move_absolute(home_target)
-        time.sleep(0.20)
-
-        # If motor started away from 1000 steps, ensure it physically travels to 1000
-        # without interrupting COM4 during movement, counting elapsed time toward N=100
-        if abs(pos_init - home_target) > 15:
-            pos_check = self.motor.read_position()
-            if abs(pos_check - pos_init) <= 5 and abs(pos_check - home_target) > 15:
-                delta_to_home = home_target - pos_check
-                self._log(
-                    f"[S3 Frame 1] Moving {delta_to_home:+d} steps from {pos_check} "
-                    f"to {home_target} baseline..."
-                )
-                self.motor.move_relative(delta_to_home)
-
-            travel_s = (
-                abs(home_target - pos_init) / max(400.0, float(self.state.speed_parameter))
-            ) + 0.30
-            t_move_end = time.time() + travel_s
-
-            while time.time() < t_move_end and completed_iters < total_iterations:
-                if self.state.stop_requested or self.state.emergency_stop_triggered:
-                    break
-                iter_t0 = time.time()
-                v_now, f_now = self.daq.read_live_force(check_safety=True)
-                # Record baseline target (1000 steps) during pre-test homing so
-                # the chart baseline matches LabVIEW's 1000.000 step header rows
-                self.state.stepper_position_steps = home_target
-                self.state.record_sample(
-                    elapsed_s=iter_t0 - start_time,
-                    pos_steps=home_target,
-                    voltage_v=v_now,
-                    force_g=f_now,
-                )
-                completed_iters += 1
-                elapsed_iter = time.time() - iter_t0
-                time.sleep(max(0.0, loop_period_s - elapsed_iter))
-
-        # Execute the remaining iterations of LabVIEW's N = 100 For Loop
-        # using parallel-equivalent deadline timing (loop_period_s = 120 ms)
-        pos_now = home_target
-        while completed_iters < total_iterations:
-            if self.state.stop_requested or self.state.emergency_stop_triggered:
-                break
-            iter_t0 = time.time()
-            pos_now = self._poll_motor_and_daq(start_time)
-            completed_iters += 1
-
-            if completed_iters in (1, 25, 50, 75, total_iterations):
-                self._log(
-                    f"[S3 Frame 1] Init {completed_iters}/{total_iterations} "
-                    f"({time.time() - start_time:.1f}s) | Pos={pos_now} steps"
-                )
-
-            # In LabVIEW, Wait(120ms) runs in parallel with POSiReadout(100ms),
-            # so we only sleep the remaining portion of the 120ms period.
-            elapsed_iter = time.time() - iter_t0
-            if elapsed_iter < loop_period_s:
-                time.sleep(loop_period_s - elapsed_iter)
-
-        # Brief quiet pause so controller UART is idle before Case 1 Cmd 1/10
-        time.sleep(0.15)
-        return pos_now
-
     def run_s3_sequence(
-        self, init_poll_iterations: int = LABVIEW_INIT_ITERATIONS
+        self, init_poll_iterations: Optional[int] = None
     ) -> None:
+        """
+        Executes Frame 1 (N=100 initialization loop) followed by Frame 2 (Cases 0, 1, 2).
+        Note: Enforces LABVIEW_FRAME1_ITERATIONS (100) even if gui.py passes
+        init_poll_iterations=5 from an earlier test configuration.
+        """
         if not self.state.s1_configured:
             raise RuntimeError("S1 parameters must be configured before running S3.")
+
+        # Always enforce the full 100-iteration LabVIEW Frame 1 loop unless > 20 is explicitly given
+        n_init_iters = (
+            init_poll_iterations
+            if (init_poll_iterations is not None and init_poll_iterations >= 50)
+            else LABVIEW_FRAME1_ITERATIONS
+        )
 
         self.state.clear_history()
         self.motor.connect()
 
-        # Apply S2 speed and give the controller 200 ms to settle
+        # Apply S2 speed (@0SI) and wait 200 ms for controller UART to settle
         self.motor.set_speed_s2(self.state.speed_parameter)
         time.sleep(0.20)
 
@@ -207,49 +139,85 @@ class S3IndentationController:
 
         start_time = time.time()
 
-        # --- S3 Frame 1: Recalibrated LabVIEW N=100 Initialization (~12.5 s) ---
-        home_steps: int = config.INITIAL_HOME_STEPS  # 1000 steps
-        current_pos: int = self._run_labview_frame1_initialization(
-            home_target=home_steps,
-            start_time=start_time,
-            total_iterations=init_poll_iterations,
-            loop_period_s=LABVIEW_INIT_PERIOD_S,
-        )
-
-        # --- S3 Frame 2: Main State Machine Loop (Cases 0, 1, 2) ---
-        set_position: int = current_pos
-        num_comd: int = 0
-        flag_direction: bool = True  # True = next command is Advance (+), False = Retract (-)
+        # =====================================================================
+        # S3 FRAME 1: LabVIEW Initialization Sequence (Left Frame of Image 14)
+        #   1. Set position = 1000, #of comd = 0, flag_direction = True
+        #   2. Call motor absposi(SubVI).vi (@0X1000\r\n) once
+        #   3. Run N = 100 For Loop polling POSiReadout.vi (~13.5 seconds total)
+        # =====================================================================
+        set_position: int = config.INITIAL_HOME_STEPS  # 1000 steps
+        num_comd: int = 0                              # #of comd = 0
+        flag_direction: bool = True                    # flag_direction = T
         total_target_comds: int = self.state.repeat_cycles * 2
+
+        self._log(
+            f"[S3 Frame 1] Sending @0X{set_position} and starting LabVIEW N={n_init_iters} "
+            f"initialization loop (~{n_init_iters * LABVIEW_FRAME1_ITER_TARGET_S:.1f}s baseline wait)..."
+        )
+        self.motor.move_absolute(set_position)
+        time.sleep(0.15)
+
+        pos_now: int = set_position
+        for i in range(n_init_iters):
+            if self.state.stop_requested or self.state.emergency_stop_triggered:
+                break
+
+            iter_t0 = time.time()
+            pos_now = self._poll_motor_and_daq(start_time)
+
+            if (i + 1) in (1, 25, 50, 75, n_init_iters):
+                self._log(
+                    f"[S3 Frame 1] Init {i + 1}/{n_init_iters} "
+                    f"({time.time() - start_time:.1f}s elapsed) | Pos={pos_now} steps"
+                )
+
+            # Enforce ~135 ms per iteration so 100 iterations = ~13.5 seconds
+            elapsed_iter = time.time() - iter_t0
+            if elapsed_iter < LABVIEW_FRAME1_ITER_TARGET_S:
+                time.sleep(LABVIEW_FRAME1_ITER_TARGET_S - elapsed_iter)
+
+        # Brief quiet pause so controller UART is 100% idle before Frame 2 starts
+        time.sleep(0.15)
+
+        # =====================================================================
+        # S3 FRAME 2: Main While Loop (Cases 0, 1, 2 @ 50 ms)
+        # =====================================================================
         case_selection: int = 0
-        active_stroke_dir: int = 0   # +1 during Advance, -1 during Retract
+        current_pos: int = pos_now
+        # Align baseline Set position with the motor's actual settled Frame 1 coordinate
+        set_position = current_pos
         prev_pos: int = current_pos
+        active_stroke_dir: int = 0   # +1 during Advance, -1 during Retract
         stall_count: int = 0
 
-        # Full stroke travel time so deceleration completes before next command
+        # Physical stroke duration (4.0s move + 0.30s stepper deceleration settle = 4.30s)
         stroke_travel_s = (
             float(self.state.advance_steps) / max(100.0, float(self.state.speed_parameter))
         ) + 0.30
         effective_wait_s = max(float(self.state.dwell_time_s), stroke_travel_s)
 
         self._log(
-            f"[S3 Frame 2] Starting {self.state.repeat_cycles} cycles from {current_pos} steps "
-            f"({total_target_comds} half-cycle commands, Step={self.state.advance_steps})..."
+            f"[S3 Frame 2] Initialization complete ({time.time() - start_time:.1f}s). "
+            f"Starting {self.state.repeat_cycles} cycles from {current_pos} steps "
+            f"({total_target_comds} commands, Step={self.state.advance_steps})..."
         )
 
         try:
             while not (self.state.stop_requested or self.state.emergency_stop_triggered):
-                # =============================================================
+                # -------------------------------------------------------------
                 # CASE 0, Default: Poll Position & Check Target Reached
-                # =============================================================
+                # -------------------------------------------------------------
                 if case_selection == 0:
                     current_pos = self._poll_motor_and_daq(start_time)
 
                     if num_comd == 0:
+                        # First pass after Frame 1: motor is settled at baseline, trigger Case 1
                         target_reached = True
                     elif active_stroke_dir > 0:
+                        # True branch (Advancing): current_pos >= Set position
                         target_reached = current_pos >= (set_position - 15)
                     else:
+                        # False branch (Retracting): current_pos <= Set position
                         target_reached = current_pos <= (set_position + 15)
 
                     # Auto-recovery if the motor stopped short of set_position
@@ -262,8 +230,8 @@ class S3IndentationController:
                         if stall_count >= 2:
                             remaining_steps = set_position - current_pos
                             self._log(
-                                f"[S3 Auto-Retry] Motor at {current_pos} steps (Target: {set_position}). "
-                                f"Sending @0U{remaining_steps:+d}..."
+                                f"[S3 Recovery] Motor stationary at {current_pos} steps "
+                                f"(Target: {set_position}). Sending @0U{remaining_steps:+d}..."
                             )
                             time.sleep(0.15)
                             self.motor.move_relative(remaining_steps)
@@ -284,18 +252,20 @@ class S3IndentationController:
 
                     inner_select = 1 if target_reached else 0
 
+                    # Outer Select node: #of comd < (重複次數 * 2)
                     if num_comd < total_target_comds:
                         case_selection = inner_select
                     else:
                         case_selection = 2
 
                     prev_pos = current_pos
-                    time.sleep(0.050)
+                    time.sleep(0.050)  # Exact 50 ms While Loop timer in Frame 2
 
-                # =============================================================
+                # -------------------------------------------------------------
                 # CASE 1: Send Relative Step (@0U), Update Set Position, & Dwell
-                # =============================================================
+                # -------------------------------------------------------------
                 elif case_selection == 1:
+                    # Frame 1 (Left of Case 1)
                     active_stroke_dir = 1 if flag_direction else -1
                     delta_steps = self.state.advance_steps * active_stroke_dir
                     start_pos = current_pos
@@ -310,9 +280,10 @@ class S3IndentationController:
                     time.sleep(0.08)
                     self.motor.move_relative(delta_steps)
                     flag_direction = not flag_direction
+
+                    # Frame 2 (Right of Case 1): increment #of comd & wait 停留時間(秒)*1000 ms
                     num_comd += 1
                     stall_count = 0
-
                     self._safe_wait_daq_only(
                         duration_s=effective_wait_s,
                         start_time=start_time,
@@ -323,9 +294,9 @@ class S3IndentationController:
                     case_selection = 0
                     time.sleep(0.050)
 
-                # =============================================================
+                # -------------------------------------------------------------
                 # CASE 2: Final Retraction Completion & Loop Stop
-                # =============================================================
+                # -------------------------------------------------------------
                 elif case_selection == 2:
                     current_pos = self._poll_motor_and_daq(start_time)
 
